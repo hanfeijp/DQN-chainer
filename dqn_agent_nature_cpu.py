@@ -6,71 +6,93 @@ Copyright (c) 2015  Naoto Yoshida All Right Reserved.
 
 import copy
 
+import argparse as ap
 import pickle
+import zipfile, os
 import numpy as np
 import scipy.misc as spm
+from datetime import datetime as dt
+import logging
+import pandas as pd
 
-from chainer import cuda, FunctionSet, Variable, optimizers
+import chainer
+from chainer import cuda, Variable, optimizers
 import chainer.functions as F
+import chainer.links as L
 
 from rlglue.agent.Agent import Agent
 from rlglue.agent import AgentLoader as AgentLoader
 from rlglue.types import Action
+import chainer.links as L
+import logging
+import logging.handlers
 
+logger = logging.getLogger('agent')
+logger.setLevel(logging.INFO)
 
-class DQN_class:
-    # Hyper-Parameters
-    gamma = 0.99  # Discount factor
-    initial_exploration = 100#10**4  # Initial exploratoin. original: 5x10^4
-    replay_size = 32  # Replay (batch) size
-    target_model_update_freq = 10**4  # Target update frequancy. original: 10^4
-    data_size = 10**5  # Data size of history. original: 10^6
+# ロガーに対するハンドラにメッセージを追加する
+LOG_FILENAME = "agent.log"
+handler = logging.handlers.RotatingFileHandler(LOG_FILENAME, maxBytes=10*1024*1024, backupCount=0,)
+logger.addHandler(handler)
 
-    def __init__(self, enable_controller=[0, 3, 4]):
-        self.num_of_actions = len(enable_controller)
-        self.enable_controller = enable_controller  # Default setting : "Pong"
-
-        print "Initializing DQN..."
-#	Initialization of Chainer 1.1.0 or older.
-#        print "CUDA init"
-#        cuda.init()
-
-        print "Model Building"
-        self.model = FunctionSet(
-            l1=F.Convolution2D(4, 32, ksize=8, stride=4, nobias=False, wscale=np.sqrt(2)),
-            l2=F.Convolution2D(32, 64, ksize=4, stride=2, nobias=False, wscale=np.sqrt(2)),
-            l3=F.Convolution2D(64, 64, ksize=3, stride=1, nobias=False, wscale=np.sqrt(2)),
-            l4=F.Linear(3136, 512, wscale=np.sqrt(2)),
-            q_value=F.Linear(512, self.num_of_actions,
-                             initialW=np.zeros((self.num_of_actions, 512),
+class ConvLayer(chainer.Chain):
+    def __init__(self, num_of_actions, gamma, replay_size, enable_controller):
+        super(ConvLayer, self).__init__(
+            l1=L.Convolution2D(4, 32, ksize=8, stride=4, nobias=False, wscale=np.sqrt(2)),
+            l2=L.Convolution2D(32, 64, ksize=4, stride=2, nobias=False, wscale=np.sqrt(2)),
+            l3=L.Convolution2D(64, 64, ksize=3, stride=1, nobias=False, wscale=np.sqrt(2)),
+            l4=L.Linear(3136, 512, wscale=np.sqrt(2)),
+            q_value=L.Linear(512, num_of_actions,
+                             initialW=np.zeros((num_of_actions, 512),
                                                dtype=np.float32))
         )
+        self.old_model = copy.deepcopy(self)
+        self.num_of_actions = num_of_actions
+        self.gamma = gamma
+        self.replay_size = replay_size
+        self.enable_controller = enable_controller
 
-        self.model_target = copy.deepcopy(self.model)
 
-        print "Initizlizing Optimizer"
-        self.optimizer = optimizers.RMSpropGraves(lr=0.00025, alpha=0.95, momentum=0.95, eps=0.0001)
-        self.optimizer.setup(self.model.collect_parameters())
+    def model_save(self):
+        self.old_model = None
+        self.old_model = copy.deepcopy(self)
 
-        # History Data :  D=[s, a, r, s_dash, end_episode_flag]
-        self.D = [np.zeros((self.data_size, 4, 84, 84), dtype=np.uint8),
-                  np.zeros(self.data_size, dtype=np.uint8),
-                  np.zeros((self.data_size, 1), dtype=np.int8),
-                  np.zeros((self.data_size, 4, 84, 84), dtype=np.uint8),
-                  np.zeros((self.data_size, 1), dtype=np.bool)]
 
-    def forward(self, state, action, Reward, state_dash, episode_end):
+    def clear(self):
+        self.loss = None
+        self.accuracy = None
+
+
+    def Q_func(self, state):
+        h1 = F.relu(self.l1(state / 255.0))  # scale inputs in [0.0 1.0]
+        h2 = F.relu(self.l2(h1))
+        h3 = F.relu(self.l3(h2))
+        h4 = F.relu(self.l4(h3))
+        Q = self.q_value(h4)
+        return Q
+
+    def Q_func_target(self, state):
+        h1 = F.relu(self.old_model.l1(state / 255.0))  # scale inputs in [0.0 1.0]
+        h2 = F.relu(self.old_model.l2(h1))
+        h3 = F.relu(self.old_model.l3(h2))
+        h4 = F.relu(self.old_model.l4(h3))
+        Q = self.old_model.q_value(h4)
+        return Q
+
+
+    def __call__(self, state, action, Reward, state_dash, episode_end):
+        self.clear()
+
         num_of_batch = state.shape[0]
         s = Variable(state)
         s_dash = Variable(state_dash)
 
         Q = self.Q_func(s)  # Get Q-value
-
         # Generate Target Signals
         tmp = self.Q_func_target(s_dash)  # Q(s',*)
-        tmp = list(map(np.max, tmp.data))  # max_a Q(s',a)
+        tmp = list(map(np.max, np.copy(tmp.data)))  # max_a Q(s',a)
         max_Q_dash = np.asanyarray(tmp, dtype=np.float32)
-        target = np.asanyarray(Q.data, dtype=np.float32)
+        target = np.copy(np.asanyarray(Q.data, dtype=np.float32))
 
         for i in xrange(num_of_batch):
             if not episode_end[i][0]:
@@ -78,17 +100,49 @@ class DQN_class:
             else:
                 tmp_ = np.sign(Reward[i])
 
-            action_index = self.action_to_index(action[i])
+            action_index = self.enable_controller.index(action[i])
             target[i, action_index] = tmp_
 
         # TD-error clipping
         td = Variable(target) - Q  # TD error
         td_tmp = td.data + 1000.0 * (abs(td.data) <= 1)  # Avoid zero division
-        td_clip = td * (abs(td.data) <= 1) + td/abs(td_tmp) * (abs(td.data) > 1)
+        td_clip = td * (abs(td.data) <= 1) + td/abs(td_tmp) * (abs(td.data) > 1) # 絶対値1以上は1に丸める。
 
         zero_val = Variable(np.zeros((self.replay_size, self.num_of_actions), dtype=np.float32))
-        loss = F.mean_squared_error(td_clip, zero_val)
-        return loss, Q
+        return td_clip, zero_val
+
+class DQN_class:
+    # Hyper-Parameters
+    gamma = 0.99  # Discount factor
+    initial_exploration = 100 #10**4  # Initial exploratoin. original: 5x10^4
+    replay_size = 32  # Replay (batch) size
+    target_model_update_freq = 10**4  # Target update frequancy. original: 10^4
+    data_size = 10**5  # Data size of history. original: 10^6
+
+    def __init__(self, enable_controller=[0, 3, 4], model=None):  # 0:noop, 3:right, 4:left
+        self.num_of_actions = len(enable_controller)
+        self.enable_controller = enable_controller  # Default setting : "Pong"
+
+        if model is None:
+            print "Model Building"
+            self.model = ConvLayer(num_of_actions=self.num_of_actions,
+                                  gamma=self.gamma, replay_size=self.replay_size,
+                                  enable_controller=enable_controller)
+        else:
+            print "exsisting model loading..."
+            self.model = model
+
+        print "Initizlizing Optimizer"
+        self.optimizer = optimizers.RMSpropGraves(lr=0.00025, alpha=0.95, momentum=0.95, eps=0.0001)
+        self.optimizer.setup(self.model)
+
+        # History Data :  D=[s, a, r, s_dash, end_episode_flag]  # state, action, Reward, state_dash, episode_end
+        self.D = [np.zeros((self.data_size, 4, 84, 84), dtype=np.uint8),
+                  np.zeros(self.data_size, dtype=np.uint8),
+                  np.zeros((self.data_size, 1), dtype=np.int8),
+                  np.zeros((self.data_size, 4, 84, 84), dtype=np.uint8),
+                  np.zeros((self.data_size, 1), dtype=np.bool)]
+
 
     def stockExperience(self, time,
                         state, action, reward, state_dash,
@@ -107,7 +161,6 @@ class DQN_class:
         self.D[4][data_index] = episode_end_flag
 
     def experienceReplay(self, time):
-
         if self.initial_exploration < time:
             # Pick up replay_size number of samples from the Data
             if time < self.data_size:  # during the first sweep of the History Data
@@ -127,46 +180,25 @@ class DQN_class:
                 s_dash_replay[i] = np.array(self.D[3][replay_index[i]], dtype=np.float32)
                 episode_end_replay[i] = self.D[4][replay_index[i]]
 
-            #s_replay = cuda.to_gpu(s_replay)
-            #s_dash_replay = cuda.to_gpu(s_dash_replay)
+            td_clip, zero_val = self.model(s_replay, a_replay, r_replay, s_dash_replay, episode_end_replay)
+            loss_val = self.optimizer.update(F.mean_squared_error, td_clip, zero_val)
 
-            # Gradient-based update
-            self.optimizer.zero_grads()
-            loss, _ = self.forward(s_replay, a_replay, r_replay, s_dash_replay, episode_end_replay)
-            loss.backward()
-            self.optimizer.update()
-
-    def Q_func(self, state):
-        h1 = F.relu(self.model.l1(state / 255.0))  # scale inputs in [0.0 1.0]
-        h2 = F.relu(self.model.l2(h1))
-        h3 = F.relu(self.model.l3(h2))
-        h4 = F.relu(self.model.l4(h3))
-        Q = self.model.q_value(h4)
-        return Q
-
-    def Q_func_target(self, state):
-        h1 = F.relu(self.model_target.l1(state / 255.0))  # scale inputs in [0.0 1.0]
-        h2 = F.relu(self.model_target.l2(h1))
-        h3 = F.relu(self.model_target.l3(h2))
-        h4 = F.relu(self.model_target.l4(h3))
-        Q = self.model_target.q_value(h4)
-        return Q
 
     def e_greedy(self, state, epsilon):
         s = Variable(state)
-        Q = self.Q_func(s)
+        Q = self.model.Q_func(s)
         Q = Q.data
 
         if np.random.rand() < epsilon:
             index_action = np.random.randint(0, self.num_of_actions)
             print "RANDOM"
         else:
-            index_action = np.argmax(Q)
+            index_action = np.argmax(Q) # とりうるアクションの中で最大のものを選ぶ
             print "GREEDY"
         return self.index_to_action(index_action), Q
 
     def target_model_update(self):
-        self.model_target = copy.deepcopy(self.model)
+        self.model.model_save()
 
     def index_to_action(self, index_of_action):
         return self.enable_controller[index_of_action]
@@ -175,19 +207,27 @@ class DQN_class:
         return self.enable_controller.index(action)
 
 
-class dqn_agent(Agent):  # RL-glue Process
+class DqnAgent(Agent, object):  # RL-glue Process
     lastAction = Action()
     policyFrozen = False
+
+    def __init__(self, time=0, epsilon=1.0, enable_controller=[0, 3, 4]): # default value of enable_controller is for "Pong"
+        super(DqnAgent, self).__init__()
+
+        self.time = time
+        self.epsilon = epsilon  # Initial exploratoin rate
+        self.enable_controller = enable_controller
 
     def agent_init(self, taskSpec):
         # Some initializations for rlglue
         self.lastAction = Action()
 
-        self.time = 0
-        self.epsilon = 1.0  # Initial exploratoin rate
-
-        # Pick a DQN from DQN_class
-        self.DQN = DQN_class()  # default is for "Pong".
+        model_file_name = 'dqn_model.dat'
+        if os.path.exists(model_file_name):
+            with open(model_file_name, 'r') as f:
+                self.DQN = DQN_class(model=pickle.load(f))
+        else:
+            self.DQN = DQN_class(enable_controller=self.enable_controller)
 
     def agent_start(self, observation):
 
@@ -213,14 +253,16 @@ class dqn_agent(Agent):  # RL-glue Process
         return returnAction
 
     def agent_step(self, reward, observation):
-
+        global  save_flg2
         # Preproces
         tmp = np.bitwise_and(np.asarray(observation.intArray[128:]).reshape([210, 160]), 0b0001111)  # Get Intensity from the observation
         obs_array = (spm.imresize(tmp, (110, 84)))[110-84-8:110-8, :]  # Scaling
-        obs_processed = np.maximum(obs_array, self.last_observation)  # Take maximum from two frames
+
+        # 前回の結果を重ねたものを使用する
+        obs_processed = np.maximum(obs_array, self.last_observation)  # Take maximum from two frames with elementwise
 
         # Compose State : 4-step sequential observation
-        self.state = np.asanyarray([self.state[1], self.state[2], self.state[3], obs_processed], dtype=np.uint8)
+        self.state = np.asanyarray([self.state[1], self.state[2], self.state[3], obs_processed], dtype=np.uint8) # idx:0 を飛ばしてずらす
         state_ = np.asanyarray(self.state.reshape(1, 4, 84, 84), dtype=np.float32)
 
         # Exploration decays along the time sequence
@@ -243,9 +285,10 @@ class dqn_agent(Agent):  # RL-glue Process
         returnAction.intArray = [action]
 
         # Learning Phase
+        loss_val = 0
         if self.policyFrozen is False:  # Learning ON/OFF
             self.DQN.stockExperience(self.time, self.last_state, self.lastAction.intArray[0], reward, self.state, False)
-            self.DQN.experienceReplay(self.time)
+            loss_val = self.DQN.experienceReplay(self.time)
 
         # Target model update
         if self.DQN.initial_exploration < self.time and np.mod(self.time, self.DQN.target_model_update_freq) == 0:
@@ -254,6 +297,8 @@ class dqn_agent(Agent):  # RL-glue Process
 
         # Simple text based visualization
         print ' Time Step %d /   ACTION  %d  /   REWARD %.1f   / EPSILON  %.6f  /   Q_max  %3f' % (self.time, self.DQN.action_to_index(action), np.sign(reward), eps, np.max(Q_now))
+        logger.info("{},{},{},{},{},{}".format(dt.now().strftime("%Y-%m-%d_%H:%M:%S"), \
+              self.time, self.DQN.action_to_index(action), np.sign(reward), eps, np.max(Q_now)))
 
         # Updates for next step
         self.last_observation = obs_array
@@ -297,9 +342,41 @@ class dqn_agent(Agent):  # RL-glue Process
             return "message understood, policy unfrozen"
 
         if inMessage.startswith("save model"):
-            with open('dqn_model.dat', 'w') as f:
+            model_file_name = 'dqn_model.dat'
+            save_time = dt.now().strftime("%Y%m%d_%H%M%S")
+            if os.path.exists(model_file_name):
+                model_file_name = 'dqn_model_' + save_time + '.dat'
+
+            with open(model_file_name, 'w') as f:
                 pickle.dump(self.DQN.model, f)
+
+            zipfile_name = 'dqn_model_' + save_time + '.zip'
+            zf = zipfile.ZipFile(zipfile_name, mode='w')
+            f_failure = False
+            try:
+                print ('adding a file.')
+                zf.write(model_file_name)
+            except:
+                f_failure = True
+            finally:
+                print ('closing')
+                zf.close()
+            if f_failure==False:
+                # delete original data file(model_file_name)
+                os.remove(model_file_name)
+
             return "message understood, model saved"
 
+
 if __name__ == "__main__":
-    AgentLoader.loadAgent(dqn_agent())
+
+    parser = ap.ArgumentParser(description='This script is to execute agent for Reinforcement Learning.')
+    parser.add_argument('-c', '--controllers', metavar='N', type=int, nargs='+', help='Enable controllers for the game.')
+    parser.add_argument("-t", "--time", default=0, type=int, help="Simulation time already passed on previous trial.")
+    parser.add_argument("-e", "--epsilon", default=1.0, type=float, help="Learning rate")
+    args = parser.parse_args()
+
+    print "INITIAL VALUE => time:{}, epsilon:{}".format(args.time, args.epsilon)
+    if args.controllers is None:
+        print "Default controllers for 'Pong' are used, because controllers are not set."
+    AgentLoader.loadAgent(DqnAgent(time=args.time, epsilon=args.epsilon, enable_controller=args.controllers))
