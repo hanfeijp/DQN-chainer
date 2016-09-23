@@ -119,11 +119,10 @@ class DQN_class:
     target_model_update_freq = 10**4  # Target update frequancy. original: 10^4
     data_size = 10**5  # Data size of history. original: 10^6
 
-    def __init__(self, enable_controller, model=None):
-        if enable_controller is None:
-            enable_controller=[0, 3, 4] # 0:noop, 3:right, 4:left (Default setting for "Pong")
+    def __init__(self, enable_controller=[0, 3, 4], model=None):  # 0:noop, 3:right, 4:left
+        enable_controller = [0, 3, 4] if enable_controller is None else enable_controller
         self.num_of_actions = len(enable_controller)
-        self.enable_controller = enable_controller  
+        self.enable_controller = enable_controller  # Default setting : "Pong"
 
         if model is None:
             print "Model Building"
